@@ -3,6 +3,9 @@ package api
 import (
 	"encoding/json"
 	"net/http"
+	"time"
+
+	"github.com/google/uuid"
 )
 
 func Handler(w http.ResponseWriter, r *http.Request) {
@@ -18,19 +21,15 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	if err := req.ValidateMethodPost(); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	if err := req.ValidatePayload(); err != nil {
+	if err := req.Validate(); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	respuesta := EventResponse{
-		Status:  "success",
-		Payload: json.RawMessage(`{"message":"bien curl mandado bien"}`),
+		Status:    "accepted",
+		Timestamp: time.Now().Format(time.RFC3339),
+		EventID:   uuid.New().String(),
 	}
 
 	w.Header().Set("Content-Type", "application/json")

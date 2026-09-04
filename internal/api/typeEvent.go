@@ -12,18 +12,16 @@ type EventRequest struct {
 }
 
 type EventResponse struct {
-	Status  string          `json:"status"`
-	Payload json.RawMessage `json:"payload"`
+	Status    string `json:"status"`
+	EventID   string `json:"id,omitempty"`
+	Timestamp string `json:"timestamp"`
 }
 
-func (e *EventRequest) ValidateMethodPost() error {
-	if e.EventType != "POST" {
-		return fmt.Errorf("Invalid event type: %s", e.EventType)
+func (e *EventRequest) Validate() error {
+	if e.EventType == "" {
+		return fmt.Errorf("Event type cannot be empty")
 	}
-	return nil
-}
 
-func (e *EventRequest) ValidatePayload() error {
 	if len(e.Payload) == 0 {
 		return fmt.Errorf("Payload cannot be empty")
 	}
