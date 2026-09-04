@@ -1,0 +1,80 @@
+# Clase: Webhook Dispatcher Engine — Sprint 1 → inicio Sprint 2
+
+> Repaso pedagógico de lo que armamos hoy. Pensado para releer y refrescar antes de retomar.
+
+## 1. El bug que arrancó todo
+
+Tu `ValidateMethodPost` comparaba `EventType` (dato de **negocio**, ej. `"order.created"`) contra el string literal `"POST"` (dato de **transporte HTTP**). Confundía dos capas distintas. El método HTTP ya se valida en el Handler con `r.Method != http.MethodPost`; `EventType` es vocabulario libre que define quien use tu sistema — tu SRS dice explícitamente que la interpretación semántica del payload/tipo está **fuera del MVP**. Tu única responsabilidad ahí es exigir que `EventType` no esté vacío, nada más.
+
+**Lección de fondo:** el nombre de una función es un contrato. `ValidateMethodPost()` prometía una cosa y hacía otra — fuente clásica de bugs cuando el sistema crece.
+
+## 2. El contrato de respuesta (`EventResponse`)
+
+Un `202 Accepted` significa *"lo recibí, todavía no sé si se entregó bien"* — nunca `"success"` (eso sería mentir sobre el resultado final, que se define async, después de reintentos). Por eso:
+- `Status: "accepted"`, no `"success"`.
+- `EventID`: el UUID generado, la única forma que el Emisor tiene de correlacionar su evento con tu auditoría después.
+- Sin devolver el `Payload` de vuelta — el Emisor ya lo tiene, es ancho de banda desperdiciado.
+- `Timestamp` siempre en **UTC** (`time.Now().UTC()`) — nunca hora local del servidor, para no tener inconsistencias entre entornos (Docker, distintas zonas horarias).
+
+## 3. Testing en Go — `testing` y `httptest`
+
+`testing` **no es una librería externa** — viene con el lenguaje. Reglas duras del compilador: archivo `_test.go`, función `TestXxx(t *testing.T)`, mismo paquete que el código testeado.
+
+- **`t.Fatalf`**: corta el test ahí mismo (usalo cuando seguir no tiene sentido, ej. si el status code ya vino mal).
+- **`t.Errorf`**: marca fallo pero sigue ejecutando (usalo para juntar varios chequeos en un solo run).
+
+`httptest.NewRequest` + `httptest.NewRecorder` simulan un request/response HTTP **en memoria**, sin abrir sockets ni levantar el servidor real. Por eso los tests corren en milisegundos y sirven en CI sin Docker. El `Handler` no distingue un request real de uno simulado — ambos son solo `http.ResponseWriter` + `*http.Request`.
+
+Escribimos 7 tests cubriendo: caso feliz completo (status + campos + Content-Type), unicidad de `EventID` entre requests (para cazar bugs de estado compartido/global), método incorrecto, JSON malformado, `EventType` vacío (el que confirma que el bug viejo no vuelve), `EventType` ausente (zero-value de string), `Payload` vacío. Todos en verde.
+
+*(Pendiente para más adelante: reescribir los casos de validación como **table-driven test** con `t.Run` — patrón idiomático de Go para no repetir estructura de test por cada caso.)*
+
+## 4. Interfaces en Go — el concepto central del día
+
+**Problema que resuelve:** si el Handler llama directo a Postgres, queda acoplado a la DB — no se puede testear sin levantar una base real, y mezclás lógica HTTP con lógica de persistencia.
+
+**Solución:** una interfaz es una lista de métodos requeridos, sin decir cómo se implementan — un "enchufe estándar", no un traductor (a diferencia de un ORM tipo SQLAlchemy, que sí traduce objetos ↔ filas SQL; nuestra interfaz no genera SQL, solo define forma).
+
+### Comparación que hicimos con otros lenguajes
+
+| | C++ | Java | Go |
+|---|---|---|---|
+| Herencia de clases | Múltiple (con problema del diamante: ambigüedad si dos padres comparten método) | Simple (`extends` una sola) | **No existe** — se usa composición (`struct` embebido) |
+| Contratos sin código | No hay concepto separado | `interface`, se pueden implementar varias | `interface`, se pueden "satisfacer" varias |
+| ¿Hay que declarar el cumplimiento? | N/A | Sí, `implements X` explícito | **No** — el compilador lo detecta por estructura (structural typing / "duck typing" estático) |
+| ¿Quién define el contrato? | El padre | Quien escribe la interfaz | **El consumidor**, típicamente |
+
+La pieza más distinta de Go: **si un struct tiene los métodos que una interfaz pide, la satisface automáticamente**, sin `implements` en ningún lado. Y la convención es que la interfaz vive del lado de quien la *necesita* (el `Service`/`Handler`), no del lado de quien la implementa (Postgres) — así el consumidor pide exactamente lo mínimo que necesita, y cualquier implementación (Postgres real, un fake en memoria para tests) puede enchufarse sin coordinación previa.
+
+## 5. `domain.Event` — el corazón del sistema
+
+```go
+type Event struct {
+    ID        string
+    EventType string
+    Body      json.RawMessage // no map, no string: JSON crudo, sin tocar
+    CreatedAt time.Time       // no string: para poder comparar/restar fechas directo
+}
+```
+
+**Por qué `json.RawMessage` y no un `map[string]interface{}`:** tu SRS (BR-004) exige inmutabilidad del payload — nunca se modifica en tránsito. Parsear a `map` y volver a serializar arriesga cambiar el JSON (orden de claves, espacios), rompiendo esa garantía, y cuesta performance extra que no necesitás porque tu sistema **nunca interpreta** el contenido del payload — fuera del MVP, según tu propio SRS.
+
+**Por qué `domain` no debe conocer `EventRequest`:** la dirección de dependencia va de afuera hacia adentro (`api` → `domain`, nunca al revés). Por eso `NewEvent(eventType string, payload json.RawMessage) Event` recibe **tipos primitivos**, no el struct `EventRequest` completo — así, el día que agregues un consumidor de RabbitMQ (Sprint 3), también va a poder construir un `Event` sin fabricar un `EventRequest` artificial que no tiene sentido en ese contexto.
+
+## 6. Las dos transformaciones (no son redundantes)
+
+1. **Bytes crudos de `r.Body` → `EventRequest`**, vía `json.NewDecoder(r.Body).Decode(&req)`. `r.Body` es un `io.ReadCloser`: un caño de lectura única con los bytes tal como llegaron por red. `Decode` los interpreta como JSON y llena `req` según las etiquetas `json:"..."` del struct.
+2. **`EventRequest` → `domain.Event`**, vía `domain.NewEvent(...)`. No es duplicar trabajo: la primera transformación pasa de "bytes sin forma" a "forma HTTP"; la segunda pasa de "forma HTTP" a "forma de dominio" (con ID generado y timestamp, desacoplada de cómo entró el dato).
+
+## 7. Nota al margen: HMAC (simétrica) — ya está en tu SRS
+
+Preguntaste por cifrado simétrico/asimétrico. Conectá esto con **FR-005** de tu propio SRS: la firma HMAC-SHA256 es criptografía **simétrica** (Dispatcher y Suscriptor comparten un secreto). HMAC **firma**, no cifra — garantiza autenticidad e integridad, el payload sigue siendo legible. Tema para retomar en Sprint 4 (Task 4.2, "Cryptographic Signer"), con más profundidad sobre por qué simétrica y no asimétrica para este caso.
+
+## 8. Dónde quedamos / próximo paso
+
+- ✅ `internal/domain/event.go` con `Event` y `NewEvent` — compila limpio.
+- 🔜 Conectar `domain.NewEvent` dentro del `Handler`, después de la validación.
+- 🔜 Ajustar `EventResponse` para usar el `ID` que devuelve `event`, no un UUID suelto generado aparte.
+- 🔜 Crear `internal/repository` con la interfaz `EventRepository` (un método: `CreateEvent(ctx, Event) error`).
+- 🔜 Implementación **fake en memoria** primero, para testear el flujo completo sin Postgres.
+- 🔜 Recién después: diseño de las 4 tablas SQL y la implementación real con `pgx`.

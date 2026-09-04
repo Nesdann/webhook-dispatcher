@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/google/uuid"
+	"github.com/Nesdann/webhook-dispatcher/internal/domain"
 )
 
 func Handler(w http.ResponseWriter, r *http.Request) {
@@ -25,11 +25,11 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-
+	event := domain.NewEvent(req.EventType, req.Payload)
 	respuesta := EventResponse{
 		Status:    "accepted",
 		Timestamp: time.Now().Format(time.RFC3339),
-		EventID:   uuid.New().String(),
+		EventID:   event.ID,
 	}
 
 	w.Header().Set("Content-Type", "application/json")
